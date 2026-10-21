@@ -142,9 +142,9 @@ function StatusCard({ info }: { info: InstanceInfo | null }) {
       </div>
       <div className="grid grid-cols-2 gap-3 text-sm">
         <Stat label="Environment" value={info?.isEc2 ? "AWS EC2" : "Local Dev"} />
-        <Stat label="Version" value={info?.appVersion || "—"} />
+        <Stat label="Version" value={info?.appVersion || "local"} />
         <Stat label="Uptime" value={info ? formatUptime(info.uptimeSeconds) : "—"} />
-        <Stat label="Node.js" value={typeof process !== "undefined" ? process.version : "—"} />
+        <Stat label="Runtime" value="Node.js 20" />
       </div>
     </div>
   );
