@@ -68,8 +68,7 @@ jobs:
         run: terraform init -backend=false -upgrade
 
       - name: Terraform Validate
-        run: |
-          terraform validate -var="deploy_artifact_bucket=ci-validation" -var="artifact_version=ci-00000000"
+        run: terraform validate
 
   scripts:
     name: "Shell Scripts — Syntax Check"

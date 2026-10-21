@@ -94,12 +94,15 @@ variable "health_check_grace_period" {
 variable "deploy_artifact_bucket" {
   description = "S3 bucket that stores versioned application release artifacts"
   type        = string
+  default     = "" # provided at deploy time via -var; empty default allows CI terraform validate to pass
 }
 
 variable "artifact_version" {
   description = "Git SHA / artifact version to deploy (e.g. abc1234)"
   type        = string
+  default     = "" # provided at deploy time via -var; empty default allows CI terraform validate to pass
 }
+
 
 variable "app_port" {
   description = "TCP port the Next.js application listens on"
