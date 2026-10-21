@@ -264,7 +264,7 @@ jobs:
             REFRESH_ID=$(aws autoscaling start-instance-refresh \
               --auto-scaling-group-name "$ASG" \
               --strategy Rolling \
-              --preferences "MinHealthyPercentage=50,InstanceWarmup=180,SkipMatching=false" \
+              --preferences "MinHealthyPercentage=50,InstanceWarmup=180,SkipMatching=true" \
               --query "InstanceRefreshId" \
               --output text \
               --region "$REGION")
@@ -298,6 +298,17 @@ jobs:
           done
           if [ "$DONE" != "true" ]; then
             echo "❌ Instance refresh did not finish within 15 minutes"
+            echo "--- refresh status ---"
+            aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" --region "$REGION" \
+              --query "InstanceRefreshes[0].[Status,StatusReason,PercentageComplete]" --output text || true
+            echo "--- recent scaling activities ---"
+            aws autoscaling describe-scaling-activities --auto-scaling-group-name "$ASG" --region "$REGION" --max-items 8 \
+              --query "Activities[].[StatusCode,Description,Cause]" --output text || true
+            echo "--- target health ---"
+            TG=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --region "$REGION" \
+              --query "AutoScalingGroups[0].TargetGroupARNs[0]" --output text || true)
+            aws elbv2 describe-target-health --target-group-arn "$TG" --region "$REGION" \
+              --query "TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason,TargetHealth.Description]" --output text || true
             exit 1
           fi
 

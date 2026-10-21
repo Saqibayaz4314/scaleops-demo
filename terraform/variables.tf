@@ -83,9 +83,9 @@ variable "instance_warmup_seconds" {
 }
 
 variable "health_check_grace_period" {
-  description = "Seconds ASG waits before running health checks on a new instance"
+  description = "Seconds ASG waits before running health checks on a new instance (must cover boot + Node install + app start)"
   type        = number
-  default     = 180
+  default     = 420
 }
 
 # ──────────────────────────────────────────────

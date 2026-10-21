@@ -24,16 +24,21 @@ echo "Artifact: s3://$ARTIFACT_BUCKET/releases/$ARTIFACT_VERSION/scaleops-demo-$
 # ──────────────────────────────────────────────
 # 1. System updates
 # ──────────────────────────────────────────────
-dnf update -y
-dnf install -y curl tar gzip shadow-utils
+# NOTE: no "dnf update -y" here. The AL2023 AMI is already current, and a full
+# update on a 1 GB t3.micro takes minutes, which can exceed the ASG health-check
+# grace period and cause an endless launch/terminate loop.
+# curl is provided by curl-minimal on AL2023, so it is not installed explicitly.
+dnf install -y tar gzip shadow-utils
 
 # ──────────────────────────────────────────────
-# 2. Install Node.js via NodeSource
+# 2. Install Node.js
 # ──────────────────────────────────────────────
 if ! command -v node &>/dev/null; then
   echo "Installing Node.js $NODE_VERSION..."
-  curl -fsSL "https://rpm.nodesource.com/setup_$${NODE_VERSION}.x" | bash -
-  dnf install -y nodejs
+  dnf install -y nodejs || {
+    curl -fsSL "https://rpm.nodesource.com/setup_$${NODE_VERSION}.x" | bash - || true
+    dnf install -y nodejs
+  }
 fi
 
 node_ver=$(node --version)
@@ -53,7 +58,18 @@ ARTIFACT_KEY="releases/$ARTIFACT_VERSION/scaleops-demo-$ARTIFACT_VERSION.tar.gz"
 ARTIFACT_LOCAL="/tmp/scaleops-demo-$ARTIFACT_VERSION.tar.gz"
 
 echo "Downloading artifact from S3..."
-aws s3 cp "s3://$ARTIFACT_BUCKET/$ARTIFACT_KEY" "$ARTIFACT_LOCAL" --region "$AWS_REGION"
+# Retry: the instance profile credentials can take a few seconds to become usable.
+for attempt in 1 2 3 4 5 6; do
+  if aws s3 cp "s3://$ARTIFACT_BUCKET/$ARTIFACT_KEY" "$ARTIFACT_LOCAL" --region "$AWS_REGION"; then
+    break
+  fi
+  echo "S3 download attempt $attempt failed; retrying in 10s..."
+  sleep 10
+  if [ "$attempt" = "6" ]; then
+    echo "FATAL: could not download s3://$ARTIFACT_BUCKET/$ARTIFACT_KEY"
+    exit 1
+  fi
+done
 
 # ──────────────────────────────────────────────
 # 5. Extract and set up application directory
@@ -132,13 +148,29 @@ systemctl start "$SERVICE_NAME"
 # 9. Wait for health check
 # ──────────────────────────────────────────────
 echo "Waiting for application to become healthy..."
+HEALTHY=false
 for i in $(seq 1 30); do
   if curl -sf "http://localhost:$APP_PORT/api/health" > /dev/null 2>&1; then
     echo "Application is healthy after $i attempts."
+    HEALTHY=true
     break
   fi
   echo "Attempt $i/30: not healthy yet, sleeping 5s..."
   sleep 5
 done
+
+if [ "$HEALTHY" != "true" ]; then
+  # Written to the console output so the failure can be read with:
+  #   aws ec2 get-console-output --instance-id <id> --latest --output text
+  echo "=== FATAL: application did not become healthy ==="
+  echo "--- node: $(command -v node || echo missing) ---"
+  echo "--- files in $APP_DIR/standalone ---"
+  ls -la "$APP_DIR/standalone" 2>&1 | head -30 || true
+  echo "--- systemctl status ---"
+  systemctl status "$SERVICE_NAME" --no-pager 2>&1 | head -30 || true
+  echo "--- journalctl ---"
+  journalctl -u "$SERVICE_NAME" -n 80 --no-pager 2>&1 || true
+  exit 1
+fi
 
 echo "=== ScaleOps Bootstrap completed at $(date -u) ==="
