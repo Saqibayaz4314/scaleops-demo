@@ -1,0 +1,241 @@
+name: "Deploy — Build, Upload & Instance Refresh"
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      rollback_version:
+        description: "Git SHA to roll back to (leave empty for fresh deploy)"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION:             ${{ vars.AWS_REGION }}
+  DEPLOY_ARTIFACT_BUCKET: ${{ vars.DEPLOY_ARTIFACT_BUCKET }}
+  AWS_ROLE_ARN:           ${{ vars.AWS_ROLE_ARN }}
+  TF_STATE_BUCKET:        ${{ vars.TF_STATE_BUCKET }}
+  TF_STATE_KEY:           ${{ vars.TF_STATE_KEY }}
+
+jobs:
+  build-and-upload:
+    name: "Build & Upload Artifact"
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_version: ${{ steps.version.outputs.sha }}
+      artifact_key:     ${{ steps.upload.outputs.key }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine artifact version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.rollback_version }}" ]; then
+            echo "sha=${{ github.event.inputs.rollback_version }}" >> "$GITHUB_OUTPUT"
+            echo "⏪ Rollback to ${{ github.event.inputs.rollback_version }}"
+          else
+            SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "🚀 Fresh deploy $SHA"
+          fi
+
+      - name: Check if artifact already exists in S3 (rollback case)
+        id: check_existing
+        run: |
+          SHA="${{ steps.version.outputs.sha }}"
+          KEY="releases/$SHA/scaleops-demo-$SHA.tar.gz"
+          if aws s3 ls "s3://$DEPLOY_ARTIFACT_BUCKET/$KEY" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Artifact already in S3 — skipping build"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.check_existing.outputs.exists == 'false'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Setup Node.js
+        if: steps.check_existing.outputs.exists == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        if: steps.check_existing.outputs.exists == 'false'
+        run: npm ci
+
+      - name: Build Next.js standalone
+        if: steps.check_existing.outputs.exists == 'false'
+        run: npm run build
+
+      - name: Package release artifact
+        if: steps.check_existing.outputs.exists == 'false'
+        run: |
+          bash scripts/package-release.sh "${{ steps.version.outputs.sha }}"
+
+      - name: Configure AWS credentials (OIDC) — for upload
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Upload artifact to S3
+        id: upload
+        run: |
+          SHA="${{ steps.version.outputs.sha }}"
+          KEY="releases/$SHA/scaleops-demo-$SHA.tar.gz"
+          if [ "${{ steps.check_existing.outputs.exists }}" = "false" ]; then
+            aws s3 cp \
+              "/tmp/scaleops-release/scaleops-demo-$SHA.tar.gz" \
+              "s3://$DEPLOY_ARTIFACT_BUCKET/$KEY" \
+              --server-side-encryption aws:kms \
+              --region "$AWS_REGION"
+            echo "✅ Uploaded to s3://$DEPLOY_ARTIFACT_BUCKET/$KEY"
+          fi
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: "Update Launch Template & Instance Refresh"
+    needs: build-and-upload
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      alb_dns: ${{ steps.tf_outputs.outputs.alb_dns }}
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+          terraform_wrapper: true
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}"
+
+      - name: Terraform Apply — update Launch Template with new artifact
+        run: |
+          terraform apply -auto-approve \
+            -var="deploy_artifact_bucket=$DEPLOY_ARTIFACT_BUCKET" \
+            -var="artifact_version=${{ needs.build-and-upload.outputs.artifact_version }}" \
+            -var="aws_region=$AWS_REGION"
+
+      - name: Get Terraform outputs
+        id: tf_outputs
+        run: |
+          echo "asg_name=$(terraform output -raw asg_name)" >> "$GITHUB_OUTPUT"
+          echo "alb_dns=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
+          echo "lt_id=$(terraform output -raw launch_template_id)" >> "$GITHUB_OUTPUT"
+          echo "lt_ver=$(terraform output -raw launch_template_latest_version)" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger ASG Instance Refresh
+        id: refresh
+        run: |
+          ASG_NAME="${{ steps.tf_outputs.outputs.asg_name }}"
+          LT_ID="${{ steps.tf_outputs.outputs.lt_id }}"
+          LT_VER="${{ steps.tf_outputs.outputs.lt_ver }}"
+
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences "MinHealthyPercentage=50,InstanceWarmup=120,SkipMatching=true" \
+            --query "InstanceRefreshId" \
+            --output text \
+            --region "$AWS_REGION")
+
+          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+          echo "🔄 Instance refresh started: $REFRESH_ID"
+
+      - name: Wait for Instance Refresh to complete
+        run: |
+          ASG_NAME="${{ steps.tf_outputs.outputs.asg_name }}"
+          REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
+          MAX_WAIT=900  # 15 minutes
+          ELAPSED=0
+
+          echo "Polling instance refresh status..."
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --instance-refresh-ids "$REFRESH_ID" \
+              --query "InstanceRefreshes[0].Status" \
+              --output text \
+              --region "$AWS_REGION")
+
+            echo "Status: $STATUS (elapsed: ${ELAPSED}s)"
+
+            case "$STATUS" in
+              Successful) echo "✅ Instance refresh complete"; break ;;
+              Failed|Cancelled) echo "❌ Instance refresh failed: $STATUS"; exit 1 ;;
+            esac
+
+            if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+              echo "⏰ Timed out waiting for instance refresh"
+              exit 1
+            fi
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+
+  verify:
+    name: "Verify Deployment"
+    needs: [build-and-upload, deploy]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Run deployment verification
+        run: |
+          bash scripts/verify-deployment.sh \
+            "${{ needs.deploy.outputs.alb_dns }}" \
+            "${{ needs.build-and-upload.outputs.artifact_version }}"
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ needs.build-and-upload.outputs.artifact_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ALB URL | ${{ needs.deploy.outputs.alb_dns }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health | ${{ needs.deploy.outputs.alb_dns }}/api/health |" >> $GITHUB_STEP_SUMMARY

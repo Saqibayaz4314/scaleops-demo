@@ -1,0 +1,201 @@
+name: "Infrastructure — Terraform Plan & Apply"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action to perform"
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      artifact_version:
+        description: "Git SHA of the artifact already uploaded to S3 (required for apply)"
+        required: false
+        type: string
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read
+
+env:
+  AWS_REGION:             ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET:        ${{ vars.TF_STATE_BUCKET }}
+  TF_STATE_KEY:           ${{ vars.TF_STATE_KEY }}
+  DEPLOY_ARTIFACT_BUCKET: ${{ vars.DEPLOY_ARTIFACT_BUCKET }}
+  AWS_ROLE_ARN:           ${{ vars.AWS_ROLE_ARN }}
+
+jobs:
+  plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    environment: infrastructure   # Requires environment protection rules in GitHub
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          ARTIFACT_VER="${{ github.event.inputs.artifact_version || 'placeholder' }}"
+          terraform plan \
+            -var="deploy_artifact_bucket=$DEPLOY_ARTIFACT_BUCKET" \
+            -var="artifact_version=$ARTIFACT_VER" \
+            -var="aws_region=$AWS_REGION" \
+            -out=tfplan \
+            -detailed-exitcode || echo "exitcode=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: terraform/tfplan
+          retention-days: 1
+
+  apply:
+    name: "Terraform Apply"
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: infrastructure
+    if: ${{ github.event.inputs.action == 'apply' }}
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}"
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: terraform/
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture outputs
+        id: outputs
+        run: |
+          echo "alb_dns=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
+          echo "asg_name=$(terraform output -raw asg_name)" >> "$GITHUB_OUTPUT"
+          echo "health_check=$(terraform output -raw health_check_url)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify ALB health
+        run: |
+          ALB_URL="${{ steps.outputs.outputs.alb_dns }}"
+          echo "Waiting up to 5 minutes for ALB health check..."
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ALB_URL/api/health" || echo "000")
+            echo "Attempt $i/30: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Application healthy at $ALB_URL"
+              break
+            fi
+            sleep 10
+          done
+
+      - name: Summary
+        run: |
+          echo "## Infrastructure Deployment Complete 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ALB URL | ${{ steps.outputs.outputs.alb_dns }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ASG Name | ${{ steps.outputs.outputs.asg_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health Check | ${{ steps.outputs.outputs.health_check }} |" >> $GITHUB_STEP_SUMMARY
+
+  destroy:
+    name: "Terraform Destroy"
+    runs-on: ubuntu-latest
+    environment: infrastructure-destroy   # Separate, stricter environment
+    if: ${{ github.event.inputs.action == 'destroy' }}
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.6"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}"
+
+      - name: Terraform Destroy
+        run: |
+          terraform destroy -auto-approve \
+            -var="deploy_artifact_bucket=$DEPLOY_ARTIFACT_BUCKET" \
+            -var="artifact_version=placeholder" \
+            -var="aws_region=$AWS_REGION"

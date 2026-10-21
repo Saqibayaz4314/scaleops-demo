@@ -1,0 +1,31 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Example tfvars — Copy this file to terraform.tfvars and fill in your values.
+# NEVER commit terraform.tfvars to source control.
+# ──────────────────────────────────────────────────────────────────────────────
+
+project_name = "scaleops-demo"
+environment  = "hackathon"
+aws_region   = "us-east-1"
+
+# Networking
+vpc_cidr            = "10.0.0.0/16"
+public_subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24"]
+
+# Compute
+instance_type = "t3.micro"
+# ami_id      = ""   # Leave empty to auto-select latest Amazon Linux 2023
+
+# Auto Scaling
+asg_min_size              = 1
+asg_desired_size          = 1
+asg_max_size              = 3
+cpu_target_value          = 50
+instance_warmup_seconds   = 120
+health_check_grace_period = 180
+
+# Deployment — set these via CI/CD environment variables or CLI flags
+deploy_artifact_bucket = "YOUR-ARTIFACT-BUCKET-NAME"
+artifact_version       = "YOUR-GIT-SHA"   # e.g. "abc1234"
+
+app_port     = 3000
+node_version = "20"
