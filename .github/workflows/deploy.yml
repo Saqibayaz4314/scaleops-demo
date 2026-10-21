@@ -242,19 +242,52 @@ jobs:
 
       - name: Start ASG Instance Refresh (Rolling Update)
         id: refresh
-        continue-on-error: true
         run: |
           ASG="${{ steps.tf_out.outputs.asg_name }}"
           REGION="${{ needs.build-and-upload.outputs.aws_region }}"
-          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+          # Check if a refresh is already in progress
+          IN_PROGRESS=$(aws autoscaling describe-instance-refreshes \
             --auto-scaling-group-name "$ASG" \
-            --strategy Rolling \
-            --preferences "MinHealthyPercentage=50,InstanceWarmup=120,SkipMatching=true" \
-            --query "InstanceRefreshId" \
-            --output text \
-            --region "$REGION") || true
-          echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
-          echo "🔄 Instance refresh: $REFRESH_ID"
+            --region "$REGION" \
+            --query "InstanceRefreshes[?Status=='InProgress'].InstanceRefreshId" \
+            --output text 2>/dev/null || echo "")
+          if [ -n "$IN_PROGRESS" ]; then
+            echo "🔄 Refresh already in progress: $IN_PROGRESS"
+            echo "refresh_id=$IN_PROGRESS" >> "$GITHUB_OUTPUT"
+          else
+            REFRESH_ID=$(aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name "$ASG" \
+              --strategy Rolling \
+              --preferences "MinHealthyPercentage=50,InstanceWarmup=180,SkipMatching=false" \
+              --query "InstanceRefreshId" \
+              --output text \
+              --region "$REGION")
+            echo "refresh_id=$REFRESH_ID" >> "$GITHUB_OUTPUT"
+            echo "🔄 Started instance refresh: $REFRESH_ID"
+          fi
+
+      - name: Wait for Instance Refresh to complete
+        run: |
+          ASG="${{ steps.tf_out.outputs.asg_name }}"
+          REGION="${{ needs.build-and-upload.outputs.aws_region }}"
+          REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
+          echo "Waiting for refresh $REFRESH_ID to complete..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG" \
+              --region "$REGION" \
+              --query "InstanceRefreshes[?InstanceRefreshId=='$REFRESH_ID'].Status" \
+              --output text 2>/dev/null || echo "Unknown")
+            echo "Attempt $i/30: refresh status = $STATUS"
+            if [ "$STATUS" = "Successful" ]; then
+              echo "✅ Instance refresh completed successfully!"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "❌ Instance refresh $STATUS"
+              exit 1
+            fi
+            sleep 30
+          done
 
   verify:
     name: "Verify Deployment"
@@ -265,13 +298,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Summary
+      - name: Configure AWS credentials (Static Keys)
+        if: ${{ vars.AWS_ROLE_ARN == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ needs.build-and-upload.outputs.aws_region }}
+
+      - name: Wait for ALB health check to pass
         run: |
+          ALB_DNS="${{ needs.deploy.outputs.alb_dns }}"
+          echo "Waiting for http://$ALB_DNS/api/health ..."
+          for i in $(seq 1 20); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "http://$ALB_DNS/api/health" || echo "000")
+            echo "Attempt $i/20: HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ App is healthy!"
+              break
+            fi
+            sleep 15
+          done
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "⚠️  App did not respond with 200 after 5 minutes. Last code: $HTTP_CODE"
+          fi
+
+      - name: Deployment Summary
+        run: |
+          ALB_DNS="${{ needs.deploy.outputs.alb_dns }}"
           echo "## 🚀 Deployment Complete!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Version** | \`${{ needs.build-and-upload.outputs.artifact_version }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **ALB DNS** | http://${{ needs.deploy.outputs.alb_dns }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Open: [http://${{ needs.deploy.outputs.alb_dns }}](http://${{ needs.deploy.outputs.alb_dns }})" >> $GITHUB_STEP_SUMMARY
+          echo "| **ALB URL** | [http://$ALB_DNS](http://$ALB_DNS) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Health** | [http://$ALB_DNS/api/health](http://$ALB_DNS/api/health) |" >> $GITHUB_STEP_SUMMARY
