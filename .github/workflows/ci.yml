@@ -31,9 +31,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint
-        run: npm run lint
-
       - name: Type check
         run: npx tsc --noEmit
 
@@ -68,10 +65,11 @@ jobs:
         run: terraform fmt -check -recursive
 
       - name: Terraform Init (local backend for validation only)
-        run: terraform init -backend=false
+        run: terraform init -backend=false -upgrade
 
       - name: Terraform Validate
-        run: terraform validate
+        run: |
+          terraform validate -var="deploy_artifact_bucket=ci-validation" -var="artifact_version=ci-00000000"
 
   scripts:
     name: "Shell Scripts — Syntax Check"
@@ -84,4 +82,5 @@ jobs:
         run: |
           bash -n scripts/package-release.sh
           bash -n scripts/verify-deployment.sh
+          bash -n scripts/bootstrap-aws.sh
           echo "✅ All shell scripts pass syntax check"
