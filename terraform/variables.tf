@@ -71,9 +71,9 @@ variable "asg_max_size" {
 }
 
 variable "cpu_target_value" {
-  description = "Target CPU utilization (%) for the scaling policy"
+  description = "Target CPU utilization (%) for the scaling policy. Kept below 50 because a single-threaded Node process cannot push a 2-vCPU t3.micro past ~50% average CPU."
   type        = number
-  default     = 50
+  default     = 40
 }
 
 variable "instance_warmup_seconds" {

@@ -350,9 +350,9 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 10_000);
-    return () => clearInterval(interval);
+    const initial = setTimeout(() => { void fetchData(); }, 0);
+    const interval = setInterval(() => { void fetchData(); }, 10_000);
+    return () => { clearTimeout(initial); clearInterval(interval); };
   }, [fetchData]);
 
   const appVersion = info?.appVersion || process.env.NEXT_PUBLIC_APP_VERSION || "local";

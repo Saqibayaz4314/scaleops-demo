@@ -16,7 +16,8 @@ terraform/tfplan
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 terraform/.terraform.lock.hcl
-terraform/terraform.tfvars   # NEVER commit — contains real values
+# NEVER commit terraform.tfvars — contains real values
+terraform/terraform.tfvars
 
 # ── Environment / secrets ────────────────────
 .env

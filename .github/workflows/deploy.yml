@@ -25,6 +25,12 @@ permissions:
   id-token: write
   contents: read
 
+# Never run two deployments at once: Terraform state locks and ASG instance
+# refreshes collide when two pushes land close together.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-upload:
     name: "Build & Upload Artifact to S3"
@@ -272,6 +278,7 @@ jobs:
           REGION="${{ needs.build-and-upload.outputs.aws_region }}"
           REFRESH_ID="${{ steps.refresh.outputs.refresh_id }}"
           echo "Waiting for refresh $REFRESH_ID to complete..."
+          DONE=false
           for i in $(seq 1 30); do
             STATUS=$(aws autoscaling describe-instance-refreshes \
               --auto-scaling-group-name "$ASG" \
@@ -281,6 +288,7 @@ jobs:
             echo "Attempt $i/30: refresh status = $STATUS"
             if [ "$STATUS" = "Successful" ]; then
               echo "✅ Instance refresh completed successfully!"
+              DONE=true
               break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
               echo "❌ Instance refresh $STATUS"
@@ -288,6 +296,10 @@ jobs:
             fi
             sleep 30
           done
+          if [ "$DONE" != "true" ]; then
+            echo "❌ Instance refresh did not finish within 15 minutes"
+            exit 1
+          fi
 
   verify:
     name: "Verify Deployment"
@@ -308,10 +320,13 @@ jobs:
 
       - name: Wait for ALB health check to pass
         run: |
-          ALB_DNS="${{ needs.deploy.outputs.alb_dns }}"
-          echo "Waiting for http://$ALB_DNS/api/health ..."
+          # Terraform's alb_dns_name output already includes the "http://" scheme.
+          ALB_URL="${{ needs.deploy.outputs.alb_dns }}"
+          case "$ALB_URL" in http://*|https://*) ;; *) ALB_URL="http://$ALB_URL" ;; esac
+          echo "Waiting for $ALB_URL/api/health ..."
+          HTTP_CODE="000"
           for i in $(seq 1 20); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "http://$ALB_DNS/api/health" || echo "000")
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "$ALB_URL/api/health" || true)
             echo "Attempt $i/20: HTTP $HTTP_CODE"
             if [ "$HTTP_CODE" = "200" ]; then
               echo "✅ App is healthy!"
@@ -320,16 +335,18 @@ jobs:
             sleep 15
           done
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "⚠️  App did not respond with 200 after 5 minutes. Last code: $HTTP_CODE"
+            echo "❌ App did not respond with 200 after 5 minutes. Last code: $HTTP_CODE"
+            exit 1
           fi
 
       - name: Deployment Summary
         run: |
-          ALB_DNS="${{ needs.deploy.outputs.alb_dns }}"
+          ALB_URL="${{ needs.deploy.outputs.alb_dns }}"
+          case "$ALB_URL" in http://*|https://*) ;; *) ALB_URL="http://$ALB_URL" ;; esac
           echo "## 🚀 Deployment Complete!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Version** | \`${{ needs.build-and-upload.outputs.artifact_version }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **ALB URL** | [http://$ALB_DNS](http://$ALB_DNS) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Health** | [http://$ALB_DNS/api/health](http://$ALB_DNS/api/health) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **ALB URL** | [$ALB_URL]($ALB_URL) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Health** | [$ALB_URL/api/health]($ALB_URL/api/health) |" >> $GITHUB_STEP_SUMMARY

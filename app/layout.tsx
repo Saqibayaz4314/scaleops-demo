@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+// Use a system font stack so builds do not need a Google Fonts network request.
 import "./globals.css";
 
-const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
+// Font family is configured in globals.css.
 
 export const metadata: Metadata = {
   title: "ScaleOps Demo | AWS Auto Scaling Application",
@@ -17,7 +17,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={inter.variable}>
+    <html lang="en">
       <body className="bg-gray-950 text-gray-100 antialiased">{children}</body>
     </html>
   );

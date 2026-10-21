@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { setImmediate as yieldToRequests } from "node:timers/promises";
 import { incrementCounter } from "@/lib/metrics";
 
 export const runtime = "nodejs";
@@ -22,12 +23,12 @@ export const dynamic = "force-dynamic";
 // ──────────────────────────────────────────────────────────────────────────────
 
 const MAX_DURATION_MS = Math.min(
-  parseInt(process.env.WORKLOAD_MAX_MS || "20000", 10),
+  (Number.isFinite(Number(process.env.WORKLOAD_MAX_MS)) && Number(process.env.WORKLOAD_MAX_MS) >= 1 ? Number(process.env.WORKLOAD_MAX_MS) : 20000),
   30000 // hard ceiling — never allow more than 30 s
 );
 
 const MAX_CONCURRENCY = Math.min(
-  parseInt(process.env.WORKLOAD_MAX_CONCURRENCY || "3", 10),
+  (Number.isInteger(Number(process.env.WORKLOAD_MAX_CONCURRENCY)) && Number(process.env.WORKLOAD_MAX_CONCURRENCY) >= 1 ? Number(process.env.WORKLOAD_MAX_CONCURRENCY) : 3),
   10
 );
 
@@ -46,10 +47,10 @@ function primeSieve(n: number): number {
 }
 
 /** Run bounded CPU work for ~durationMs milliseconds */
-function runBoundedWork(durationMs: number): {
+async function runBoundedWork(durationMs: number): Promise<{
   primeCount: number;
   iterationsCompleted: number;
-} {
+}> {
   const deadline = Date.now() + durationMs;
   let primeCount = 0;
   let iterations = 0;
@@ -58,6 +59,8 @@ function runBoundedWork(durationMs: number): {
   while (Date.now() < deadline) {
     primeCount = primeSieve(500_000);
     iterations++;
+    // Yield between bounded chunks so health checks and concurrency guards can run.
+    await yieldToRequests();
   }
 
   return { primeCount, iterationsCompleted: iterations };
@@ -96,11 +99,15 @@ export async function GET(request: NextRequest) {
     MAX_DURATION_MS
   );
 
+  if (!Number.isFinite(requestedMs) || requestedMs < 1) {
+    return NextResponse.json({ error: "durationMs must be a positive number" }, { status: 400 });
+  }
+
   activeConcurrency++;
   const startedAt = Date.now();
 
   try {
-    const result = runBoundedWork(requestedMs);
+    const result = await runBoundedWork(requestedMs);
     const elapsed = Date.now() - startedAt;
 
     return NextResponse.json({

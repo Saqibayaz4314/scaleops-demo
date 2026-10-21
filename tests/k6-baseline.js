@@ -19,10 +19,11 @@ export const options = {
   thresholds: {
     http_req_duration: ["p(95)<2000"],
     errors: ["rate<0.05"],
+    checks: ["rate>0.95"],
   },
 };
 
-export default function () {
+export default function baseline() {
   // Hit the health endpoint
   const health = http.get(`${ALB_URL}/api/health`);
   check(health, {

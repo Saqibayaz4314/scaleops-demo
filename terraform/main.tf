@@ -352,6 +352,19 @@ resource "aws_autoscaling_group" "main" {
   health_check_type         = "ELB"
   health_check_grace_period = var.health_check_grace_period
 
+  # Publish per-group metrics (incl. GroupInServiceInstances) so instance count
+  # can be charted over time in CloudWatch / ScaleOps.
+  enabled_metrics = [
+    "GroupDesiredCapacity",
+    "GroupInServiceInstances",
+    "GroupMinSize",
+    "GroupMaxSize",
+    "GroupPendingInstances",
+    "GroupTotalInstances",
+  ]
+
+  metrics_granularity = "1Minute"
+
   launch_template {
     id      = aws_launch_template.main.id
     version = aws_launch_template.main.latest_version
